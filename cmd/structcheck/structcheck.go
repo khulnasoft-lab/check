@@ -12,28 +12,27 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-package main
+package structcheck
 
 import (
 	"flag"
 	"fmt"
 	"go/ast"
+	"go/token"
 	"go/types"
-	"log"
-	"os"
 
-	"golang.org/x/tools/go/packages"
+	"golang.org/x/tools/go/loader"
 )
 
 var (
-	assignmentsOnly = flag.Bool("a", false, "Count assignments only")
-	loadTestFiles   = flag.Bool("t", false, "Load test files too")
-	reportExported  = flag.Bool("e", false, "Report exported fields")
-	buildTags       = flag.String("tags", "", "Build tags")
+	assignmentsOnly = flag.Bool("structcheck.a", false, "Count assignments only")
+	loadTestFiles   = flag.Bool("structcheck.t", false, "Load test files too")
+	buildTags       = flag.String("structcheck.tags", "", "Build tags")
 )
 
 type visitor struct {
-	pkg  *packages.Package
+	prog *loader.Program
+	pkg  *loader.PackageInfo
 	m    map[types.Type]map[string]int
 	skip map[types.Type]struct{}
 }
@@ -60,7 +59,7 @@ func (v *visitor) assignment(t types.Type, fieldName string) {
 
 func (v *visitor) typeSpec(node *ast.TypeSpec) {
 	if strukt, ok := node.Type.(*ast.StructType); ok {
-		t := v.pkg.TypesInfo.Defs[node.Name].Type()
+		t := v.pkg.Info.Defs[node.Name].Type()
 		for _, f := range strukt.Fields.List {
 			if len(f.Names) > 0 {
 				fieldName := f.Names[0].Name
@@ -71,7 +70,7 @@ func (v *visitor) typeSpec(node *ast.TypeSpec) {
 }
 
 func (v *visitor) typeAndFieldName(expr *ast.SelectorExpr) (types.Type, string, bool) {
-	selection := v.pkg.TypesInfo.Selections[expr]
+	selection := v.pkg.Info.Selections[expr]
 	if selection == nil {
 		return nil, "", false
 	}
@@ -102,7 +101,7 @@ func (v *visitor) assignStmt(node *ast.AssignStmt) {
 }
 
 func (v *visitor) compositeLiteral(node *ast.CompositeLit) {
-	t := v.pkg.TypesInfo.Types[node.Type].Type
+	t := v.pkg.Info.Types[node.Type].Type
 	for _, expr := range node.Elts {
 		if kv, ok := expr.(*ast.KeyValueExpr); ok {
 			if ident, ok := kv.Key.(*ast.Ident); ok {
@@ -141,36 +140,22 @@ func (v *visitor) Visit(node ast.Node) ast.Visitor {
 	return v
 }
 
-func main() {
-	flag.Parse()
-	exitStatus := 0
-	importPaths := flag.Args()
-	if len(importPaths) == 0 {
-		importPaths = []string{"."}
-	}
+type Issue struct {
+	Pos       token.Position
+	Type      string
+	FieldName string
+}
 
-	var flags []string
-	if *buildTags != "" {
-		flags = append(flags, fmt.Sprintf("-tags=%s", *buildTags))
-	}
-	cfg := &packages.Config{
-		Mode:       packages.LoadSyntax,
-		Tests:      *loadTestFiles,
-		BuildFlags: flags,
-	}
-	pkgs, err := packages.Load(cfg, importPaths...)
-	if err != nil {
-		log.Fatalf("could not load packages: %s", err)
-	}
-
-	reported := make(map[string]bool) // track already reported information.
-	for _, pkg := range pkgs {
+func Run(program *loader.Program, reportExported bool) []Issue {
+	var issues []Issue
+	for _, pkg := range program.InitialPackages() {
 		visitor := &visitor{
 			m:    make(map[types.Type]map[string]int),
 			skip: make(map[types.Type]struct{}),
+			prog: program,
 			pkg:  pkg,
 		}
-		for _, f := range pkg.Syntax {
+		for _, f := range pkg.Files {
 			ast.Walk(visitor, f)
 		}
 
@@ -179,15 +164,13 @@ func main() {
 				continue
 			}
 			for fieldName, v := range visitor.m[t] {
-				if !*reportExported && ast.IsExported(fieldName) {
+				if !reportExported && ast.IsExported(fieldName) {
 					continue
 				}
 				if v == 0 {
-					field, _, _ := types.LookupFieldOrMethod(t, false, pkg.Types, fieldName)
+					field, _, _ := types.LookupFieldOrMethod(t, false, pkg.Pkg, fieldName)
 					if field == nil {
-						unknown := fmt.Sprintf("%s: unknown field or method: %s.%s\n", pkg.Types.Path(), t, fieldName)
-						report(unknown, reported)
-						exitStatus = 1
+						fmt.Printf("%s: unknown field or method: %s.%s\n", pkg.Pkg.Path(), t, fieldName)
 						continue
 					}
 					if fieldName == "XMLName" {
@@ -195,24 +178,16 @@ func main() {
 							continue
 						}
 					}
-					pos := pkg.Fset.Position(field.Pos())
-					unused := fmt.Sprintf("%s: %s:%d:%d: %s.%s\n",
-						pkg.Types.Path(), pos.Filename, pos.Line, pos.Column,
-						types.TypeString(t, nil), fieldName,
-					)
-					report(unused, reported)
-					exitStatus = 1
+					pos := program.Fset.Position(field.Pos())
+					issues = append(issues, Issue{
+						Pos:       pos,
+						Type:      types.TypeString(t, nil),
+						FieldName: fieldName,
+					})
 				}
 			}
 		}
 	}
-	os.Exit(exitStatus)
-}
 
-func report(message string, reported map[string]bool) {
-	if reported[message] {
-		return
-	}
-	fmt.Print(message)
-	reported[message] = true
+	return issues
 }
