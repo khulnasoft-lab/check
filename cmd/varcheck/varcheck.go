@@ -11,26 +11,21 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-package main
+package varcheck
 
 import (
 	"flag"
-	"fmt"
 	"go/ast"
 	"go/token"
-	"log"
-	"os"
-	"sort"
 	"strings"
 
 	"go/types"
 
-	"golang.org/x/tools/go/packages"
+	"golang.org/x/tools/go/loader"
 )
 
 var (
-	reportExported = flag.Bool("e", false, "Report exported variables and constants")
-	buildTags      = flag.String("tags", "", "Build tags")
+	buildTags = flag.String("varcheck.tags", "", "Build tags")
 )
 
 type object struct {
@@ -39,7 +34,8 @@ type object struct {
 }
 
 type visitor struct {
-	pkg        *packages.Package
+	prog       *loader.Program
+	pkg        *loader.PackageInfo
 	uses       map[object]int
 	positions  map[object]token.Position
 	insideFunc bool
@@ -68,7 +64,7 @@ func (v *visitor) decl(obj types.Object) {
 		v.uses[key] = 0
 	}
 	if _, ok := v.positions[key]; !ok {
-		v.positions[key] = v.pkg.Fset.Position(obj.Pos())
+		v.positions[key] = v.prog.Fset.Position(obj.Pos())
 	}
 }
 
@@ -88,13 +84,13 @@ func isReserved(name string) bool {
 func (v *visitor) Visit(node ast.Node) ast.Visitor {
 	switch node := node.(type) {
 	case *ast.Ident:
-		v.use(v.pkg.TypesInfo.Uses[node])
+		v.use(v.pkg.Info.Uses[node])
 
 	case *ast.ValueSpec:
 		if !v.insideFunc {
 			for _, ident := range node.Names {
 				if !isReserved(ident.Name) {
-					v.decl(v.pkg.TypesInfo.Defs[ident])
+					v.decl(v.pkg.Info.Defs[ident])
 				}
 			}
 		}
@@ -126,57 +122,42 @@ func (v *visitor) Visit(node ast.Node) ast.Visitor {
 	return v
 }
 
-func main() {
-	flag.Parse()
-	exitStatus := 0
-	importPaths := flag.Args()
-	if len(importPaths) == 0 {
-		importPaths = []string{"."}
-	}
+type Issue struct {
+	Pos     token.Position
+	VarName string
+}
 
-	var flags []string
-	if *buildTags != "" {
-		flags = append(flags, fmt.Sprintf("-tags=%s", *buildTags))
-	}
-	cfg := &packages.Config{
-		Mode:       packages.LoadSyntax,
-		Tests:      true,
-		BuildFlags: flags,
-	}
-	pkgs, err := packages.Load(cfg, importPaths...)
-	if err != nil {
-		log.Fatalf("could not load packages: %s", err)
-	}
-
+func Run(program *loader.Program, reportExported bool) []Issue {
+	var issues []Issue
 	uses := make(map[object]int)
 	positions := make(map[object]token.Position)
 
-	for _, pkg := range pkgs {
+	for _, pkgInfo := range program.InitialPackages() {
+		if pkgInfo.Pkg.Path() == "unsafe" {
+			continue
+		}
+
 		v := &visitor{
-			pkg:       pkg,
+			prog:      program,
+			pkg:       pkgInfo,
 			uses:      uses,
 			positions: positions,
 		}
 
-		for _, f := range v.pkg.Syntax {
+		for _, f := range v.pkg.Files {
 			ast.Walk(v, f)
 		}
 	}
 
-	var lines []string
-
 	for obj, useCount := range uses {
-		if useCount == 0 && (*reportExported || !ast.IsExported(obj.name)) {
+		if useCount == 0 && (reportExported || !ast.IsExported(obj.name)) {
 			pos := positions[obj]
-			lines = append(lines, fmt.Sprintf("%s: %s:%d:%d: %s", obj.pkgPath, pos.Filename, pos.Line, pos.Column, obj.name))
-			exitStatus = 1
+			issues = append(issues, Issue{
+				Pos:     pos,
+				VarName: obj.name,
+			})
 		}
 	}
 
-	sort.Strings(lines)
-	for _, line := range lines {
-		fmt.Println(line)
-	}
-
-	os.Exit(exitStatus)
+	return issues
 }
